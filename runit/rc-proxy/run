@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# rolling-context proxy, supervised by runit so it survives hook script exit
+export HOME=/data/data/com.termux/files/home
+export PREFIX=/data/data/com.termux/files/usr
+cd /data/data/com.termux/files/home/.claude/plugins/cache/nestor-local/rolling-context/1.13.4/proxy
+exec /data/data/com.termux/files/usr/bin/python3.14 server.py
