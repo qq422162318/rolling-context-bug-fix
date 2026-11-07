@@ -43,6 +43,44 @@ Outbound TLS trust store is EMPTY: ... Upstream requests will fail CERTIFICATE_V
 `400 Model ... is not configured`。确认 `settings.json` 的 `model` 与
 `ANTHROPIC_MODEL` 是网关实际支持的名字。
 
+### 4. `http://` 上游 + `HTTPS_PROXY` 指向 MITM → ECONNRESET / connection dropped
+
+**这是最隐蔽的一个：代理本身完全正常，但 Claude Code 一启动就报 connection dropped。**
+
+`wire.py`（被 SessionStart hook 调用）会无条件把 `HTTPS_PROXY` 写成 MITM 前端
+（`http://127.0.0.1:5590`）。MITM 前端只终止 TLS：它只接受 `CONNECT`，对明文
+HTTP 请求直接关掉连接（`mitm_frontend._read_connect_line`）。
+
+Claude Code 只有在目标 URL 是 `https://` 时才发 `CONNECT`。当上游是明文
+`http://`（自建网关常见，如 `http://116.205.124.216:3456`）时，Claude Code 发的是
+普通绝对路径 `POST`，MITM 读到首行发现不是 CONNECT 就关闭 →
+`ECONNRESET: The socket connection was closed unexpectedly` → 用户看到
+"connection dropped" / PROXYERROR。
+
+**诊断特征：**
+- 代理日志里完全没有 `[MSG]` 记录（请求根本没到 rolling-context）
+- `curl http://127.0.0.1:5588/v1/messages` 返回 200（代理正常）
+- `curl -x http://127.0.0.1:5590 ...` 返回 000（MITM 丢弃明文）
+- 改 `settings.json` 的 `HTTPS_PROXY=5588` 后一启动又被改回 5590（wire.py 覆写）
+
+**修复：** 打 `patches/wire-http-upstream.patch`。它让 `wire.py` 按终端上游的
+scheme 选择入口：`https` → MITM（可拦截重写）；`http` → core（5588，明文也能
+压缩转发）。
+
+```bash
+cd ~/.claude/plugins/cache/nestor-plugins/rolling-context/1.13.4/proxy
+cp -p wire.py wire.py.orig
+patch -p1 < ~/rolling-context-bug-fix/patches/wire-http-upstream.patch
+```
+
+验证：
+
+```bash
+python3 wire.py --name rolling-context --settings ~/.claude/settings.json
+python3 -c "import json;print(json.load(open('/home/user/.claude/settings.json'))['env']['HTTPS_PROXY'])"
+# 应输出 http://127.0.0.1:5588
+```
+
 ## 修复方案
 
 | 平台 | 进程托管 | 关键命令 |
@@ -120,6 +158,9 @@ rolling-context-bug-fix/
 ├── runit/rc-proxy/run          # Termux runit 服务定义
 └── scripts/
     ├── fix-proxy.sh            # WSL/Linux 一键修复（certifi + setsid）
+    └── ...
+patches/
+    └── wire-http-upstream.patch # http 上游时 HTTPS_PROXY 指向 core 而非 MITM
     └── wsl-autostart.sh        # Windows 计划任务入口包装
 ```
 
