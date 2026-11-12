@@ -81,6 +81,45 @@ python3 -c "import json;print(json.load(open('/home/user/.claude/settings.json')
 # 应输出 http://127.0.0.1:5588
 ```
 
+### 5. 请求进入 RAW 分支、缓存 token 漏计或重复计数（2026-11-12）
+
+新增补丁：`patches/messages-routing-and-usage.patch`，基于 rolling-context **v1.13.4**，包含：
+
+- 识别 HTTP 代理的绝对 URL 请求，将 `/v1/messages?beta=true` 交给压缩处理器，保留查询参数。
+- 合并 `message_start` / `message_delta` 中的输入和缓存用量，最终事件只包含输出用量时不丢失先前统计。
+- 支持 `data:` 后无空格的 SSE，以及非流式 JSON 响应的用量解析。
+- 原生 Anthropic 输入、缓存读取、缓存写入按互斥字段相加；旧 cc-router 若保留 OpenAI `input_tokens_details`，按显式总输入计数，不重复相加。没有明确字段标记时不猜测协议语义。
+- 对非法、缺失、字符串和浮点 token 用量容错，不把未知缓存状态当作零命中。
+- 新增 `proxy/usage.py`、8 项用量测试与 14 项路由/本地 mock 端到端测试；测试不调用真实模型 API。
+
+此补丁与上面的 `wire-http-upstream.patch` 互补：前者修复 **server 路由与统计**，后者选择 **HTTP/HTTPS 代理入口**。不能只修改 cc-router 就认为插件路由问题也已修复。
+
+#### 应用到未打过本节补丁的 v1.13.4
+
+在插件根目录（不是 `proxy` 子目录）执行；替换路径中的 marketplace 名称以匹配实际安装：
+
+```bash
+PLUGIN="$HOME/.claude/plugins/cache/nestor-plugins/rolling-context/1.13.4"
+PATCH="$HOME/rolling-context-bug-fix/patches/messages-routing-and-usage.patch"
+cd "$PLUGIN"
+patch --dry-run --forward -p1 < "$PATCH"
+# 仅在 dry-run 成功后执行：
+cp -p proxy/server.py "proxy/server.py.bak-$(date +%Y%m%d-%H%M%S)"
+patch --forward -p1 < "$PATCH"
+python -I tests/test_usage.py
+python -I tests/test_absolute_uri.py
+```
+
+若已安装本仓库的部分或全部路由/用量修复，dry-run 可能失败。不要强制套用或忽略冲突，应先比较本地改动；升级到其他插件版本也需要重新检查。
+
+#### 验证结果与加载边界
+
+2026-11-12：本地 8 项用量测试、14 项路由/压缩测试、67 项开关检查以及既有 wire/transport-flip 检查通过。mock 下一轮会话从 **21,536 → 2,414 字符**，并验证 800 总输入 / 600 缓存不被错算成 1,400 而提前触发压缩。
+
+补丁应用后需重启代理才能加载，**不会自动重启或更改 settings.json**。代理正在压缩或持有内存摘要时，不要直接杀进程；先等待在途任务结束，理解重启会清空未持久化的摘要。插件缓存更新可能覆盖本地补丁。
+
+相关 cc-router 修复见用户仓库 `qq422162318/cc-router`：Responses/Chat Completions 输出互斥 Anthropic 输入字段，反向 Responses 还原总输入；转发、探测与 OAuth 统一从设置读取出口代理，并在成功重启代理服务时原子替换客户端。这不代表远程实例已部署新代码。
+
 ## 修复方案
 
 | 平台 | 进程托管 | 关键命令 |
