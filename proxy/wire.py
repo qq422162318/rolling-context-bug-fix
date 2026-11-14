@@ -143,6 +143,20 @@ def wire_env(name: str, env: dict, ca_cert_path: str, notes=None) -> dict:
 
     my_core_url = f"http://127.0.0.1:{my_core_port}"
     my_mitm_url = f"http://127.0.0.1:{my_mitm_port}"
+
+    # The MITM front-end only terminates TLS: it accepts CONNECT and replies
+    # "200 Connection Established", then wraps the socket in TLS. Claude Code
+    # issues CONNECT only when ANTHROPIC_BASE_URL (or the URL it targets) is
+    # https. When the upstream is plain http — a custom gateway on :3456, say —
+    # Claude Code sends an ordinary absolute-path POST to HTTPS_PROXY. The MITM
+    # front-end reads the first line, sees it is not CONNECT, and closes the
+    # socket immediately (mitm_frontend._read_connect_line). Claude Code gets
+    # ECONNRESET and reports "connection dropped" / PROXYERROR. The fix is to
+    # point HTTPS_PROXY at the CORE listener, which understands plain HTTP and
+    # applies the same compression/forwarding logic. See issue: "http upstream
+    # + HTTPS_PROXY=mitm => ECONNRESET".
+    def _mitm_capable(url: str) -> bool:
+        return (urlparse(url).scheme or "https").lower() == "https"
     other_core_url = f"http://127.0.0.1:{other_core_port}"
     own_ports = {my_core_port, my_mitm_port}
 
@@ -225,14 +239,19 @@ def wire_env(name: str, env: dict, ca_cert_path: str, notes=None) -> dict:
         return env
 
     # Otherwise (unset / api / already mine): I own HTTPS_PROXY.
-    env["HTTPS_PROXY"] = my_mitm_url
+    # Choose the entrypoint by what the terminal upstream speaks. https -> MITM
+    # (it can intercept and rewrite); http -> CORE (MITM would drop the
+    # connection: it only accepts CONNECT, and Claude Code will not CONNECT to
+    # a plaintext endpoint).
+    entry = my_mitm_url if _mitm_capable(terminal) else my_core_url
+    env["HTTPS_PROXY"] = entry
     my_up = (env.get(me["upstream"]) or "").strip()
     if _url_port(my_up) == other_core_port:
         # Sibling core is chained behind me — keep it.
-        note(f"HTTPS_PROXY = {my_mitm_url} (upstream kept: {my_up})")
+        note(f"HTTPS_PROXY = {entry} (upstream kept: {my_up})")
     else:
         env[me["upstream"]] = terminal
-        note(f"HTTPS_PROXY = {my_mitm_url} (upstream -> {terminal})")
+        note(f"HTTPS_PROXY = {entry} (upstream -> {terminal})")
     return env
 
 
