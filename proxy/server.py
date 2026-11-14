@@ -696,7 +696,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     @_track_request("POST")
     def do_POST(self):
         log.info(f"[REQ] POST {self.path}")
-        if self.path.startswith("/v1/messages"):
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/v1/messages"):
+            # HTTP forward proxies receive an absolute-form request target.
+            # Match its path just like do_GET, then forward origin-form while
+            # preserving query parameters such as Claude Code's beta=true.
+            self.path = parsed.path + ("?" + parsed.query if parsed.query else "")
             self._handle_messages()
         else:
             self._proxy_raw("POST")
@@ -1075,13 +1080,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                     f"fresh={usage.get('input_tokens', 0):,})"
                                 )
 
-                        # Proxy/converter: usage in message_delta.usage (e.g. CodeGate)
+                        # Proxy/converter: usage in message_delta.usage (e.g. CodeGate).
+                        # Cached input belongs to the context too, even when a
+                        # converter only supplies its final usage in this event.
                         elif evt_type == "message_delta":
                             usage = data.get("usage", {})
-                            tokens = int(usage.get("input_tokens", 0))
-                            if tokens > 0 and tokens > total_input:
+                            tokens = (
+                                int(usage.get("input_tokens", 0))
+                                + int(usage.get("cache_creation_input_tokens", 0))
+                                + int(usage.get("cache_read_input_tokens", 0))
+                            )
+                            if tokens > 0 and tokens >= total_input:
                                 total_input = tokens
-                                log.info(f"[MSG] Input tokens from message_delta: {total_input:,}")
+                                cache_read = int(usage.get("cache_read_input_tokens", 0))
+                                log.info(
+                                    f"[MSG] Input tokens from message_delta: {total_input:,} "
+                                    f"(cache_read={cache_read:,} "
+                                    f"cache_create={usage.get('cache_creation_input_tokens', 0):,} "
+                                    f"fresh={usage.get('input_tokens', 0):,})"
+                                )
 
                     if total_input == 0:
                         sse_lines = [l for l in text.split("\n") if l.startswith("data: ")]
