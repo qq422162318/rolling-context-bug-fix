@@ -698,7 +698,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         log.info(f"[REQ] POST {self.path}")
         parsed = urlparse(self.path)
-        if parsed.path.startswith("/v1/messages"):
+        # Exact match only: /v1/messages/count_tokens also starts with
+        # /v1/messages, and routing it here would inject the rolling summary
+        # prefix into a request whose whole point is measuring the real
+        # conversation — corrupting the count. It (and any future subpath)
+        # goes through untouched.
+        if parsed.path.rstrip("/") == "/v1/messages":
             # HTTP forward proxies receive an absolute-form request target.
             # Match its path just like do_GET, then forward origin-form while
             # preserving query parameters such as Claude Code's beta=true.
@@ -1046,10 +1051,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
 
+            # Usage extraction is only meaningful on a successful response.
+            # Error responses (ccr relays upstream 502s with a small JSON or
+            # SSE error body) carry no usage — parsing them produced a
+            # noisy "No input tokens found in SSE" warning on every upstream
+            # hiccup. The char-estimate fallback below still runs, so trigger
+            # accounting stays correct for the (genuinely large) conversation.
+            response_ok = resp.status == 200
             # Merge partial usage and distinguish explicit OpenAI totals from
             # native Anthropic's disjoint fresh/cache fields.
             input_usage = InputUsage()
-            if is_streaming and buffer:
+            if response_ok and is_streaming and buffer:
                 try:
                     text = buffer.decode("utf-8", errors="replace")
                     for line in text.split("\n"):
@@ -1094,7 +1106,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         )
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse SSE for tokens: {e}")
-            elif not is_streaming and buffer:
+            elif response_ok and not is_streaming and buffer:
                 try:
                     data = json.loads(buffer)
                     usage = data.get("usage", {})

@@ -71,9 +71,16 @@ class RoutingTests(unittest.TestCase):
         self.check_route("https://upstream.example/v1/messages?beta=true",
                          "messages", "/v1/messages?beta=true")
 
-    def test_existing_count_tokens_route(self):
+    def test_count_tokens_passes_through_untouched(self):
+        # /v1/messages/count_tokens must NOT enter the compression path —
+        # injecting a summary prefix there would corrupt the very measurement
+        # Claude Code relies on for context tracking.
         self.check_route("http://upstream.example/v1/messages/count_tokens",
-                         "messages", "/v1/messages/count_tokens")
+                         "raw", "http://upstream.example/v1/messages/count_tokens")
+
+    def test_count_tokens_origin_form(self):
+        self.check_route("/v1/messages/count_tokens?beta=true",
+                         "raw", "/v1/messages/count_tokens?beta=true")
 
     def test_other_post_routes_unchanged(self):
         for path in ("/v1/other?x=1", "http://upstream.example/v1/other?x=1"):
