@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 import endpoints
 import switch
 from compressor import RollingCompressor
+from usage import InputUsage
 
 class FlushRotatingHandler(logging.handlers.RotatingFileHandler):
     def emit(self, record):
@@ -1041,64 +1042,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 total_bytes += len(chunk)
-                if is_streaming:
-                    buffer += chunk
+                buffer += chunk  # JSON responses also carry authoritative usage.
 
             log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
 
-            # Extract input tokens from SSE stream
+            # Merge partial usage and distinguish explicit OpenAI totals from
+            # native Anthropic's disjoint fresh/cache fields.
+            input_usage = InputUsage()
             if is_streaming and buffer:
                 try:
                     text = buffer.decode("utf-8", errors="replace")
                     for line in text.split("\n"):
-                        if not line.startswith("data: "):
+                        if not line.startswith("data:"):
                             continue
-                        data_str = line[6:]
+                        data_str = line[5:]
+                        if data_str.startswith(" "):
+                            data_str = data_str[1:]
+                        data_str = data_str.rstrip("\r")
                         if data_str == "[DONE]":
                             continue
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(data, dict):
+                            continue
                         evt_type = data.get("type", "")
 
-                        # Anthropic native: usage in message_start.message.usage
                         if evt_type == "message_start":
-                            usage = data.get("message", {}).get("usage", {})
-                            tokens = (
-                                usage.get("input_tokens", 0)
-                                + usage.get("cache_creation_input_tokens", 0)
-                                + usage.get("cache_read_input_tokens", 0)
-                            )
-                            if tokens > 0:
-                                total_input = tokens
-                                cache_read = usage.get("cache_read_input_tokens", 0)
-                                log.info(
-                                    f"[MSG] Input tokens from message_start: {total_input:,} "
-                                    f"(cache_read={cache_read:,} "
-                                    f"cache_create={usage.get('cache_creation_input_tokens', 0):,} "
-                                    f"fresh={usage.get('input_tokens', 0):,})"
-                                )
-
-                        # Proxy/converter: usage in message_delta.usage (e.g. CodeGate).
-                        # Cached input belongs to the context too, even when a
-                        # converter only supplies its final usage in this event.
+                            message = data.get("message", {})
+                            usage = message.get("usage", {}) if isinstance(message, dict) else {}
                         elif evt_type == "message_delta":
                             usage = data.get("usage", {})
-                            tokens = (
-                                int(usage.get("input_tokens", 0))
-                                + int(usage.get("cache_creation_input_tokens", 0))
-                                + int(usage.get("cache_read_input_tokens", 0))
+                        else:
+                            continue
+                        if input_usage.update(usage):
+                            total_input = input_usage.total
+                            cache_read = input_usage.cache_read
+                            log.info(
+                                f"[MSG] Input tokens from {evt_type}: {total_input:,} "
+                                f"(cache_read={cache_read if cache_read is not None else 'unknown'} "
+                                f"cache_create={input_usage.cache_creation:,} "
+                                f"fresh={input_usage.fresh:,})"
                             )
-                            if tokens > 0 and tokens >= total_input:
-                                total_input = tokens
-                                cache_read = int(usage.get("cache_read_input_tokens", 0))
-                                log.info(
-                                    f"[MSG] Input tokens from message_delta: {total_input:,} "
-                                    f"(cache_read={cache_read:,} "
-                                    f"cache_create={usage.get('cache_creation_input_tokens', 0):,} "
-                                    f"fresh={usage.get('input_tokens', 0):,})"
-                                )
 
                     if total_input == 0:
                         sse_lines = [l for l in text.split("\n") if l.startswith("data: ")]
@@ -1112,16 +1098,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 try:
                     data = json.loads(buffer)
                     usage = data.get("usage", {})
-                    total_input = (
-                        usage.get("input_tokens", 0)
-                        + usage.get("cache_creation_input_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
-                    )
+                    input_usage.update(usage)
+                    total_input = input_usage.total
+                    cache_read = input_usage.cache_read
                     if total_input > 0:
-                        cache_read = usage.get("cache_read_input_tokens", 0)
                         log.info(
                             f"[MSG] Input tokens from response: {total_input:,} "
-                            f"(cache_read={cache_read:,})"
+                            f"(cache_read={cache_read if cache_read is not None else 'unknown'})"
                         )
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse response for tokens: {e}")
