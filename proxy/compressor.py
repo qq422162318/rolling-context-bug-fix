@@ -72,6 +72,33 @@ _SUMMARIZER_SCHEME = _parsed_summarizer.scheme
 _SUMMARIZER_PATH = _parsed_summarizer.path or ""
 
 
+def _summarizer_timeout(body_bytes: int) -> int:
+    """Read timeout for one summarizer call, scaled to payload size.
+
+    A flat 120s was fine against api.anthropic.com but starves relay chains
+    (rolling-context -> cc-router -> provider): a flattened retry carries the
+    whole conversation as text and a slow provider needs minutes to summarize
+    it. ~2KB/s floor, capped at 600s; ROLLING_CONTEXT_SUMMARIZER_TIMEOUT
+    overrides outright.
+    """
+    override = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_TIMEOUT")
+    if override:
+        try:
+            return max(10, int(override))
+        except ValueError:
+            pass
+    return max(120, min(600, body_bytes // 2048))
+
+
+def _is_transport_error(e: Exception) -> bool:
+    """True when the request died before an HTTP response worth trusting —
+    timeouts, connection cuts, truncated bodies. RuntimeError('Summarization
+    API returned NNN') means the endpoint answered; that is not transport.
+    """
+    return isinstance(e, (TimeoutError, ConnectionError, OSError,
+                          http.client.HTTPException))
+
+
 def _summarizer_conn(timeout=600):
     """Create a connection to the summarizer server (same style as server.py)."""
     if _SUMMARIZER_SCHEME == "https":
@@ -596,7 +623,7 @@ class RollingCompressor:
             f"format={SUMMARIZER_FORMAT} model={model}"
         )
 
-        conn = _summarizer_conn(timeout=120)
+        conn = _summarizer_conn(timeout=_summarizer_timeout(len(req_body)))
         conn.request("POST", path, body=req_body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
@@ -663,14 +690,35 @@ class RollingCompressor:
             except Exception as e:
                 if not NATIVE_FALLBACK:
                     raise
-                # A third-party endpoint that choked on the cloned request
-                # shape. One flattened retry beats a 300s cooldown and a
-                # session that never compresses at all.
-                log.warning(
-                    f"Native compaction failed against {SUMMARIZER_BASE_URL} "
-                    f"({e}); retrying flattened"
-                )
-                use_native = False
+                # Transport failures (timeout, connection cut mid-body) are
+                # usually transient upstream hangs — observed with a ccr relay
+                # whose provider stalled. One immediate native retry keeps the
+                # prompt-cache hit that is native mode's whole point; HTTP
+                # error responses (which would just repeat) and a second
+                # transport failure fall through to flattened.
+                if _is_transport_error(e):
+                    log.warning(
+                        f"Native compaction hit a transport error ({e}); "
+                        f"retrying native once before falling back"
+                    )
+                    try:
+                        new_summary = self._summarize_native(
+                            payload, messages, keep_from_idx, auth_headers)
+                    except Exception as e2:
+                        log.warning(
+                            f"Native compaction failed again ({e2}); "
+                            f"retrying flattened"
+                        )
+                        use_native = False
+                else:
+                    # A third-party endpoint that choked on the cloned request
+                    # shape. One flattened retry beats a 300s cooldown and a
+                    # session that never compresses at all.
+                    log.warning(
+                        f"Native compaction failed against {SUMMARIZER_BASE_URL} "
+                        f"({e}); retrying flattened"
+                    )
+                    use_native = False
         if not use_native:
             existing_summary = self._extract_summary(messages) if has_existing_summary else ""
             to_compress = messages[start_idx:keep_from_idx]
