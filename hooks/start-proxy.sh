@@ -25,13 +25,35 @@ fi
 _python() {
     if [ "$IS_WINDOWS" = true ]; then
         echo "python"
-    elif command -v python3 &>/dev/null; then
+        return
+    fi
+    # The MITM front-end (the :5590 entrypoint HTTPS_PROXY actually points at)
+    # needs the `cryptography` package to mint the local CA. On Termux the
+    # first `python3` on PATH can be a user bootstrap (e.g. ~/.local/bin/python3
+    # -> 3.12) that has no cryptography, while the system interpreter
+    # (/usr/bin/python3 -> 3.14, which `pkg install python-cryptography` fills)
+    # does. Picking the bare `python3` then let the proxy bind :5588 while :5590
+    # stayed closed: every request through HTTPS_PROXY failed with PROXYERROR,
+    # and the only symptom was "proxy did not answer on :5588 within ~8s".
+    # So: prefer an interpreter that can actually import cryptography, and
+    # fall back to plain `python3` only if none can.
+    local c
+    for c in ${ROLLING_CONTEXT_PYTHON:-} python3 python3.14 python3.13 python3.12 python; do
+        [ -n "$c" ] || continue
+        command -v "$c" &>/dev/null || continue
+        if "$c" -c 'import cryptography' &>/dev/null; then
+            echo "$c"
+            return
+        fi
+    done
+    if command -v python3 &>/dev/null; then
         echo "python3"
     else
         echo "python"
     fi
 }
 PYTHON_CMD=$(_python)
+log "Using interpreter: $PYTHON_CMD ($(command -v "$PYTHON_CMD" 2>/dev/null))"
 
 log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 
@@ -115,6 +137,10 @@ _clear_recorded_proxy() {
 
 _probe() {
     $PYTHON_CMD "$SCRIPT_DIR/probe.py" "$PORT" "${1:-2}" 2>/dev/null
+}
+
+_mitm_port() {
+    echo "${ROLLING_CONTEXT_MITM_PORT:-5590}"
 }
 
 _probe_pid() {
@@ -239,18 +265,42 @@ if [ ! -f "$PROXY_DIR/server.py" ]; then
     exit 0
 fi
 log "Starting proxy..."
-(
-    cd "$PROXY_DIR" || exit 1
+# On Termux/Android, a process spawned from this hook is BOUND to the hook
+# script's lifetime: when the script exits, the device reaps every child it
+# left behind — nohup, disown, setsid, even a full daemonize double-fork all
+# die within ~2s with a 0-byte log. A SessionStart hook always exits right
+# after spawning, so a plain background server can never survive. The proxy
+# therefore runs as a runit SERVICE (runsvdir/rc-proxy): runsvdir is the
+# long-lived Termux supervisor, and a service it supervises survives any hook
+# or session ending. `sv start` is idempotent — if the service is already up,
+# it no-ops. On non-Termux hosts we fall back to a plain background job.
+SVDIR="${ROLLING_CONTEXT_SVDIR:-/data/data/com.termux/files/usr/var/service}"
+SERVICE="$SVDIR/rc-proxy"
+if command -v sv &>/dev/null && [ -x "$SERVICE/run" ]; then
+    sv start "$SERVICE" >/dev/null 2>&1 || true
+    # Keep the run script in sync with this install on plugin updates.
+    if [ -r "$SERVICE/run" ]; then
+        grep -q "$PROXY_DIR" "$SERVICE/run" 2>/dev/null || {
+            log "Re-pointing rc-proxy service at $PROXY_DIR"
+            sed -i "s|^cd .*|cd $PROXY_DIR|" "$SERVICE/run"
+            sv restart "$SERVICE" >/dev/null 2>&1 || true
+        }
+    fi
+else
+    log "runit not available on this host — falling back to plain background spawn (may not survive on Termux)"
+    cd "$PROXY_DIR" || { log "ERROR: cannot cd to $PROXY_DIR"; exit 0; }
     nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
-)
+fi
 
 # Confirm it came up, rather than assuming. A start that fails — port taken,
 # python missing, a syntax error in the proxy — used to be invisible: the hook
 # exited 0, the session was already pointed at this port, and the only symptom
 # was ConnectionRefused on every request, with nothing in this log to explain
-# it. Bounded at ~8s so a cold start never stalls the session for long.
+# it. Bounded so a cold start never stalls the session for long. Termux on
+# aarch64 cold-starts python3.14 + cryptography in ~5-9s, so the window is 20s
+# here rather than the 8s that kept reporting a healthy proxy as dead.
 SECONDS=0
-while [ "$SECONDS" -lt 8 ]; do
+while [ "$SECONDS" -lt 20 ]; do
     case "$(_probe 0.5)" in
         "ours $CURRENT_VERSION")
             # Record the PID /health reports, not $! — under git-bash on
@@ -261,11 +311,27 @@ while [ "$SECONDS" -lt 8 ]; do
             echo "$_pid" > "$PIDFILE"
             echo "$CURRENT_VERSION" > "$VERFILE"
             log "Proxy healthy on :$PORT (v$CURRENT_VERSION, PID $_pid)"
+            # :$PORT serving is necessary but NOT sufficient: Claude Code does
+            # not talk to :$PORT, it talks to the MITM front-end on :5590 via
+            # HTTPS_PROXY. If that front-end failed to start (classically: the
+            # `cryptography` package is missing), the proxy looks healthy here
+            # while every request dies with PROXYERROR. Say so explicitly
+            # instead of reporting success.
+            if ! $PYTHON_CMD - "$(_mitm_port)" <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket(); s.settimeout(1.5)
+sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)
+PY
+            then
+                log "ERROR: MITM front-end is NOT listening on :$(_mitm_port) — Claude Code is wired to HTTPS_PROXY=http://127.0.0.1:$(_mitm_port) and every request will fail with PROXYERROR. Most common cause: the 'cryptography' package is not installed for $PYTHON_CMD. Fix: pkg install python-cryptography (or pip install cryptography), then restart the proxy with /rolling-context:restart."
+            else
+                log "MITM front-end healthy on :$(_mitm_port) (HTTPS_PROXY entrypoint)"
+            fi
             exit 0
             ;;
     esac
     sleep 0.25
 done
-log "ERROR: proxy did not answer on :$PORT within ~8s of starting — see $HOME/.claude/rolling-context-proxy.log"
+log "ERROR: proxy did not answer on :$PORT within ~20s of starting — see $HOME/.claude/rolling-context-proxy.log"
 
 exit 0
