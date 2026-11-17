@@ -31,6 +31,50 @@ import switch
 from compressor import RollingCompressor
 from usage import InputUsage
 
+class ClientGone(Exception):
+    """Raised when the CLIENT (Claude Code / the SDK) closed its socket mid-
+    response. Benign: the SDK abandons a stream it no longer wants and retries,
+    so there is nobody left to send an error to. Kept distinct from real
+    upstream failures, which still deserve a 502 and a stack trace."""
+
+
+# Winsock: 10053 WSAECONNABORTED, 10054 WSAECONNRESET (surfaced as
+# ConnectionResetError/BrokenPipeError on Windows), 10058 WSAESHUTDOWN.
+_CLIENT_GONE_WINERRNOS = {10053, 10054, 10058}
+
+
+def _is_client_gone(exc) -> bool:
+    """True when `exc` means our write to the client failed, not upstream.
+
+    Any failure to write `self.wfile` is by definition a client-side problem —
+    the upstream connection is a separate socket (see `conn`). Read-side
+    failures on the client stream land here too (the client half-closed while
+    we were still streaming), and they are equally non-recoverable.
+    """
+    if isinstance(exc, (BrokenPipeError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, ConnectionResetError):
+        return True
+    return getattr(exc, "winerror", None) in _CLIENT_GONE_WINERRNOS
+
+
+# Upstream-side transport failures that a retry actually fixes: the gateway
+# dropped a pooled/idle connection, or was mid-restart. NOT 10065
+# (WSAEHOSTUNREACH) — that is the gateway host being unreachable, which is
+# worth a real error and a stack trace.
+_RETRYABLE_UPSTREAM = (ConnectionResetError, ConnectionRefusedError,
+                       ConnectionAbortedError, http.client.RemoteDisconnected,
+                       http.client.CannotSendRequest,
+                       http.client.BadStatusLine)
+
+
+def _is_retryable_upstream(exc) -> bool:
+    if isinstance(exc, _RETRYABLE_UPSTREAM):
+        return True
+    # Windows surfaces a dead pooled connection as OSError 10053/10054
+    return getattr(exc, "winerror", None) in (10053, 10054)
+
+
 class FlushRotatingHandler(logging.handlers.RotatingFileHandler):
     def emit(self, record):
         super().emit(record)
@@ -669,13 +713,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
             log.info(f"[RAW] Done streaming {total_bytes:,} bytes")
             conn.close()
         except Exception as e:
+            if _is_client_gone(e):
+                # The client hung up (it reads what it needs from a stream and
+                # closes). There is no one to deliver a 502 to, so say so once
+                # at debug and let the connection go.
+                log.debug(f"[RAW] Client closed mid-response: {e}")
+                return
             log.error(f"[RAW] Upstream error: {e}", exc_info=True)
-            error_body = json.dumps({"error": endpoints.annotate_upstream_tls_error(e)}).encode()
-            self.send_response(502)
+            self._send_error(502, e)
+
+    def _send_error(self, status: int, exc) -> bool:
+        """Best-effort error response. Returns False if the client is gone.
+
+        Previously this ran inline in the handler's `except` block, so when the
+        client had ALSO disconnected the write raised a second
+        ConnectionResetError that replaced the original traceback — that is the
+        bare `end_headers()` stack every log was full of.
+        """
+        error_body = json.dumps(
+            {"error": endpoints.annotate_upstream_tls_error(exc)}).encode()
+        try:
+            self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(error_body)))
             self.end_headers()
             self.wfile.write(error_body)
+            return True
+        except Exception as write_err:
+            log.debug(f"Client gone while sending {status}: {write_err}")
+            return False
 
     def do_GET(self):
         log.info(f"[REQ] GET {self.path}")
@@ -1013,8 +1079,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             conn = _upstream_conn()
             upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
-            conn.request("POST", upstream_full_path, body=body, headers=headers)
-            resp = conn.getresponse()
+            # One immediate retry for a dropped/refused connection: these come
+            # from a gateway that closed an idle pooled socket or was mid-
+            # restart, and the very next attempt goes through. Without this the
+            # user sees a 502 for what is a sub-second blip on the gateway side.
+            try:
+                conn.request("POST", upstream_full_path, body=body, headers=headers)
+                resp = conn.getresponse()
+            except Exception as transport_err:
+                if not _is_retryable_upstream(transport_err):
+                    raise
+                log.info(
+                    f"[MSG] Upstream connection dropped ({transport_err!r}) — "
+                    f"retrying once")
+                conn.close()
+                conn = _upstream_conn()
+                conn.request("POST", upstream_full_path, body=body, headers=headers)
+                resp = conn.getresponse()
 
             log.info(f"[MSG] Upstream response: {resp.status} {resp.reason}")
 
@@ -1040,16 +1121,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             total_bytes = 0
             total_input = 0
             cache_read = None  # None = usage didn't report a cache split
+            # A client that hangs up mid-stream must NOT skip the bookkeeping
+            # below: usage accounting and the compression trigger run on what
+            # the upstream already told us. Letting the exception escape the
+            # outer `except` also meant the client (already gone) got a second
+            # 502 attempt, which raised again and buried the real traceback.
+            client_gone = False
             while True:
                 chunk = resp.read1(8192)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except Exception as write_err:
+                    if not _is_client_gone(write_err):
+                        raise
+                    client_gone = True
+                    log.debug(
+                        f"[MSG] Client closed after {total_bytes:,} bytes "
+                        f"({write_err}) — finishing bookkeeping")
                 total_bytes += len(chunk)
                 buffer += chunk  # JSON responses also carry authoritative usage.
 
-            log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
+            log.info(
+                f"[MSG] Done streaming {total_bytes:,} bytes"
+                + (" (client disconnected early)" if client_gone else ""))
 
             # Usage extraction is only meaningful on a successful response.
             # Error responses (ccr relays upstream 502s with a small JSON or
@@ -1238,13 +1335,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     entry["thread"] = t
 
         except Exception as e:
+            if _is_client_gone(e):
+                # Expected and harmless: the SDK abandons streams and retries.
+                # Logged at debug so the real upstream failures below stay
+                # findable in a log that runs to megabytes.
+                log.debug(f"[MSG] Client closed mid-response: {e}")
+                return
             log.error(f"[MSG] Upstream error: {e}", exc_info=True)
-            error_body = json.dumps({"error": endpoints.annotate_upstream_tls_error(e)}).encode()
-            self.send_response(502)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(error_body)))
-            self.end_headers()
-            self.wfile.write(error_body)
+            self._send_error(502, e)
 
 
 class ThreadedHTTPServer(HTTPServer):
